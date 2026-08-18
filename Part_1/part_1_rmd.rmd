@@ -1,0 +1,323 @@
+---
+title: "ST2195 Coursework — Part 1: Random Walk Metropolis Algorithm"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    self_contained: true
+    keep_md: false
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+# Global chunk options — apply to every code chunk unless overridden
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 5,
+  dev       = "png"          
+)
+
+set.seed(42)  # global random seed for reproducibility
+```
+
+---
+
+# Introduction
+
+This report implements and analyses the **Random Walk Metropolis** algorithm
+(a specific instance of the Metropolis–Hastings MCMC algorithm) applied to
+the **Laplace distribution**:
+
+$$f(x) = \frac{1}{2}\,e^{-|x|}, \qquad x \in \mathbb{R}$$
+
+The Laplace distribution is symmetric around 0 with a sharp peak (heavier
+tails than the Normal).  Its true mean is **0** and its true standard
+deviation is $\sqrt{2} \approx 1.4142$.
+
+---
+
+# Part 1(a): Sampling from the Laplace Distribution
+
+## Algorithm Description
+
+The **Random Walk Metropolis** algorithm generates a Markov chain
+$x_0, x_1, \ldots, x_N$ whose stationary distribution is $f(x)$.
+
+**Step 1.** Choose initial value $x_0$, number of iterations $N$, and
+proposal standard deviation $s > 0$.
+
+**Step 2.** For $i = 1, \ldots, N$:
+
+1. Draw a **proposal** $x^* \sim \mathcal{N}(x_{i-1},\, s^2)$.
+2. Compute the **log-acceptance ratio** (numerically safer than the raw ratio):
+$$\log r(x^*, x_{i-1}) = \log f(x^*) - \log f(x_{i-1}) = -|x^*| + |x_{i-1}|$$
+3. Draw $u \sim \text{Uniform}(0,1)$.
+4. If $\log u < \log r$, **accept**: set $x_i = x^*$.  
+   Otherwise, **reject**: set $x_i = x_{i-1}$.
+
+The full chain has $N + 1$ elements $(x_0, x_1, \ldots, x_N)$.
+
+## Implementation
+
+```{r metropolis_rw}
+# -------------------------------------------------------------------
+# Log of the target density  log f(x) = -log(2) - |x|
+# We only need differences, so the constant -log(2) cancels.
+# -------------------------------------------------------------------
+log_target <- function(x) -abs(x)
+
+# -------------------------------------------------------------------
+# metropolis_rw()
+#   N  : number of MCMC steps
+#   s  : proposal standard deviation
+#   x0 : starting value
+#
+# Returns a numeric vector of length N+1: (x_0, x_1, ..., x_N)
+# -------------------------------------------------------------------
+metropolis_rw <- function(N = 10000, s = 1, x0 = 0) {
+
+  x <- numeric(N + 1)   # pre-allocate N+1 slots
+  x[1] <- x0            # R is 1-indexed, so x[1] = x_0
+
+  for (i in seq(2, N + 1)) {
+    proposal <- rnorm(1, mean = x[i - 1], sd = s)
+
+    # Log-acceptance ratio
+    log_r <- log_target(proposal) - log_target(x[i - 1])
+
+    # Accept or reject
+    if (log(runif(1)) < log_r) {
+      x[i] <- proposal
+    } else {
+      x[i] <- x[i - 1]
+    }
+  }
+
+  return(x)   # length N+1
+}
+```
+
+## Running the Chain
+
+We run the sampler with $N = 10000$, $s = 1$, $x_0 = 0$.
+
+The returned vector has $N + 1 = \mathbf{10001}$ elements.  
+We use $(x_1, \ldots, x_N)$ — **excluding** the initial seed $x_0$ — for
+all analysis below.
+
+```{r run_chain}
+chain   <- metropolis_rw(N = 10000, s = 1, x0 = 0)  # length 10 001
+samples <- chain[-1]                                  # x_1 ... x_N  (10 000 values)
+
+cat("Full chain length  (x_0 to x_N):", length(chain),   "[should be 10 001]\n")
+cat("Samples used       (x_1 to x_N):", length(samples), "[should be 10 000]\n")
+```
+
+## Visualisation: Histogram + KDE + True Laplace PDF
+
+All three elements are overlaid in a **single figure** so the quality of the
+MCMC approximation can be judged at a glance.
+
+| Layer | Colour | Role |
+|-------|--------|------|
+| Histogram | light blue | Non-parametric density estimate from the samples |
+| KDE | red | Smooth kernel density estimate |
+| True PDF | black dashed | Theoretical Laplace(0,1) — the sampling target |
+
+```{r plot_all_three}
+library(ggplot2)
+
+# True Laplace density on a fine grid
+x_grid  <- seq(-10, 10, length.out = 800)
+true_pdf <- 0.5 * exp(-abs(x_grid))
+df_true  <- data.frame(x = x_grid, density = true_pdf)
+
+# Data frame of MCMC samples
+df_samples <- data.frame(x = samples)
+
+ggplot(df_samples, aes(x = x)) +
+
+  # 1. Histogram (density scale)
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 60, fill = "lightblue", colour = "white",
+                 alpha = 0.7) +
+
+  # 2. KDE
+  geom_density(colour = "red", linewidth = 1, aes(linetype = "KDE")) +
+
+  # 3. True Laplace PDF
+  geom_line(data = df_true,
+            aes(x = x, y = density, linetype = "True Laplace PDF"),
+            colour = "black", linewidth = 1) +
+
+  # Labels and theme
+  scale_linetype_manual(name   = "Legend",
+                        values = c("KDE" = "solid",
+                                   "True Laplace PDF" = "dashed")) +
+  labs(
+    title    = "Random Walk Metropolis — Laplace(0, 1) target  (N = 10 000, s = 1, x\u2080 = 0)",
+    subtitle = "Histogram of samples (blue), KDE (red), True PDF (black dashed)",
+    x        = "x",
+    y        = "Density"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+## Monte Carlo Estimates of Mean and Standard Deviation
+
+The sample mean and sample standard deviation are **Monte Carlo estimates**
+of the true moments.
+
+```{r stats}
+sample_mean <- mean(samples)
+sample_sd   <- sd(samples)
+
+cat(sprintf("Sample mean               : %.6f\n",  sample_mean))
+cat(sprintf("Sample standard deviation : %.6f\n",  sample_sd))
+cat(sprintf("(True mean = 0,  true sd  = %.6f)\n", sqrt(2)))
+```
+
+The estimates are close to the true values, confirming that the sampler
+has successfully explored the Laplace distribution.
+
+---
+
+# Part 1(b): Gelman–Rubin $\hat{R}$ Diagnostic
+
+## Background
+
+A single MCMC chain is not enough to confirm convergence — it could be
+stuck in one region of the distribution.  The **Gelman–Rubin** diagnostic
+compares **multiple chains** started from different initial values.
+
+Given $J$ chains $\{x_i^{(j)}\}_{i=1}^{N}$, $j = 1, \ldots, J$:
+
+**Within-chain statistics:**
+$$M_j = \frac{1}{N}\sum_{i=1}^{N} x_i^{(j)}, \qquad
+  V_j = \frac{1}{N}\sum_{i=1}^{N}\bigl(x_i^{(j)} - M_j\bigr)^2$$
+
+**Between-chain statistics:**
+$$W = \frac{1}{J}\sum_{j=1}^{J} V_j, \qquad
+  M   = \frac{1}{J}\sum_{j=1}^{J} M_j, \qquad
+  B   = \frac{1}{J}\sum_{j=1}^{J}(M_j - M)^2$$
+
+**Diagnostic:**
+$$\hat{R} = \sqrt{\frac{B + W}{W}}$$
+
+- $\hat{R} \approx 1$ → chains agree → **converged**
+- $\hat{R} > 1.05$ → chains disagree → **not converged**
+
+## Implementation
+
+```{r rhat_functions}
+# -------------------------------------------------------------------
+# compute_Rhat()
+#   chains : a list of numeric vectors, each of length N+1
+#            (the full chain including x_0)
+# Returns the scalar R-hat value.
+# -------------------------------------------------------------------
+compute_Rhat <- function(chains) {
+
+  J   <- length(chains)
+
+  # Use x_1 ... x_N only (drop x_0 = first element)
+  spc <- lapply(chains, function(ch) ch[-1])
+
+  Mj <- sapply(spc, mean)              # within-chain means
+  Vj <- sapply(spc, function(s)        # within-chain variances  (1/N, not 1/(N-1))
+    mean((s - mean(s))^2))
+
+  W    <- mean(Vj)                     # overall within-chain variance
+  M    <- mean(Mj)                     # overall mean
+  B    <- mean((Mj - M)^2)            # between-chain variance
+
+  Rhat <- sqrt((B + W) / W)
+  return(Rhat)
+}
+
+# -------------------------------------------------------------------
+# run_chains()
+#   Runs J chains from dispersed starting points and returns R-hat.
+# -------------------------------------------------------------------
+run_chains <- function(N = 2000, s = 0.001, J = 4) {
+  starting_points <- c(-5, 0, 5, 10)
+  chains <- lapply(seq_len(J),
+                   function(j) metropolis_rw(N = N, s = s,
+                                             x0 = starting_points[j]))
+  compute_Rhat(chains)
+}
+```
+
+## $\hat{R}$ for N = 2000, s = 0.001, J = 4
+
+With $s = 0.001$ the Gaussian proposal is extremely narrow — almost every
+proposal is accepted, but the chain barely moves from its starting value.
+Because the four chains begin at $-5, 0, 5, 10$ and cannot mix in only
+2000 steps, we expect $\hat{R} \gg 1$.
+
+```{r rhat_specific}
+set.seed(0)
+rhat_s001 <- run_chains(N = 2000, s = 0.001, J = 4)
+cat(sprintf("R-hat (N=2000, s=0.001, J=4) = %.4f\n", rhat_s001))
+```
+
+The large value confirms that the algorithm has **not** converged at this
+choice of $s$.
+
+## $\hat{R}$ over a Grid of 1000 s Values
+
+Keeping $N = 2000$ and $J = 4$ fixed, we evaluate $\hat{R}$ at **1000**
+equally spaced values of $s$ in $[0.001,\, 1]$.
+
+
+## Plot: $\hat{R}$ vs Proposal Standard Deviation $s$
+
+```{r rhat_grid_and_plot}
+set.seed(1)
+s_values    <- seq(0.001, 1, length.out = 1000)
+Rhat_values <- sapply(s_values, function(s)
+                 run_chains(N = 2000, s = s, J = 4))
+
+cat(sprintf("Computed %d R-hat values.\n", length(Rhat_values)))
+
+df_rhat <- data.frame(s = s_values, Rhat = Rhat_values)
+
+ggplot(df_rhat, aes(x = s, y = Rhat)) +
+  geom_line(colour = "steelblue", linewidth = 0.8) +
+  geom_hline(aes(yintercept = 1.05, linetype = "Threshold R-hat = 1.05"),
+             colour = "red", linewidth = 1) +
+  scale_linetype_manual(name = "", values = "dashed") +
+  labs(
+    title    = expression("Gelman\u2013Rubin " * hat(R) *
+                          " vs Proposal Standard Deviation " * italic(s)),
+    subtitle = "N = 2000, J = 4 chains started at x\u2080 \u2208 {-5, 0, 5, 10}",
+    x        = expression("Proposal Std Dev (" * italic(s) * ")"),
+    y        = expression(hat(R))
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+**Interpretation:**
+
+- For **small $s$** (near 0.001) the chains are stuck near their starting
+  values and $\hat{R}$ is very large — indicating poor convergence.
+- As $s$ grows the chains mix more effectively and $\hat{R}$ drops toward
+  the convergence threshold of 1.05, then continues to decline toward 1.
+
+---
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```

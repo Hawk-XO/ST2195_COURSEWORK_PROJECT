@@ -1,0 +1,1427 @@
+---
+title: "ST2195 Programming for Data Science"
+subtitle: Coursework 2 – 2009 ASA Flight Data Analysis (2004–2008)
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+This notebook answers all three questions using US domestic flight data
+from 2004 to 2008. All CSV files must be placed in a `data/` subfolder
+next to this `.Rmd` file.
+
+------------------------------------------------------------------------
+
+**Questions**
+
+-   **Question A** – What are the best times and days of the week to
+    minimise delays each year?
+-   **Question B** – Do older planes suffer more delays on a
+    year-to-year basis?
+-   **Question C** – Fit a logistic regression model for the probability
+    of diverted flights and visualise how the coefficients change across
+    years.
+
+------------------------------------------------------------------------
+
+**Data files required** (place inside `data/`)
+
+| File | Description |
+|------------------------------------|------------------------------------|
+| `2004.csv` – `2008.csv` | Flight records for each year |
+| `airports.csv` | Airport IATA codes with state, latitude and longitude |
+| `plane-data.csv` | Aircraft tail numbers with manufacture year |
+| `carriers.csv` | IATA carrier codes mapped to full airline names |
+| `data/shapefiles/cb_2024_us_state_500k.shp` | US state shapefile for Question C maps |
+
+------------------------------------------------------------------------
+
+# 1. Setup {#setup}
+
+Loads all packages, sets constants, and resolves paths.
+
+| Constant      | Default   | Purpose                                  |
+|---------------|-----------|------------------------------------------|
+| `CHUNK_SIZE`  | 200,000   | Rows per fread iteration in Question C   |
+| `SAMPLE_SIZE` | 5,000,000 | Max flights sampled per year in Part C   |
+| `TRAIN_YEARS` | 2004–2007 | Years used to train the prediction model |
+| `TEST_YEAR`   | 2008      | Year held out for testing                |
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo        = TRUE,
+  message     = FALSE,
+  warning     = FALSE,
+  fig.width   = 12,
+  fig.height  = 6,
+  dpi         = 150,
+  cache       = FALSE
+)
+```
+
+```{r libraries-and-constants}
+# ── Packages 
+suppressPackageStartupMessages({
+  library(data.table)   # fast file reading and data manipulation
+  library(dplyr)        # pipe operator and tidy verbs
+  library(readr)        # used only for plane-data.csv (handles BOM/encoding reliably)
+  library(ggplot2)      # all plots
+  library(patchwork)    # combining multiple ggplot panels
+  library(scales)       # colour scale helpers (squish, etc.)
+  library(RColorBrewer) # diverging palettes for heatmaps
+  library(glmnet)       # ridge logistic regression (L2 penalty)
+  library(Matrix)       # sparse.model.matrix for one-hot encoding
+  library(pROC)         # ROC curve and AUC
+  library(sf)           # US state shapefiles
+})
+
+options(datatable.showProgress = FALSE)
+
+# Paths 
+# BASE_DIR resolves to the folder containing this .Rmd file.
+# All CSV files must sit inside BASE_DIR/data/.
+BASE_DIR <- getwd()
+DATA_DIR <- file.path(BASE_DIR, "data")
+
+# Constants
+YEARS       <- c(2004L, 2005L, 2006L, 2007L, 2008L)
+TRAIN_YEARS <- c(2004L, 2005L, 2006L, 2007L)
+TEST_YEAR   <- 2008L
+CHUNK_SIZE  <- 200000L
+
+# Max rows sampled per year in Part C.
+SAMPLE_SIZE <- 5000000L
+
+set.seed(42L)  # ensures reproducible sampling across all questions
+
+# Day-of-week label maps (1=Monday … 7=Sunday, matching the raw data)
+DAY_LABELS <- c(
+  "1"="Monday",   "2"="Tuesday", "3"="Wednesday",
+  "4"="Thursday", "5"="Friday",  "6"="Saturday", "7"="Sunday"
+)
+DAY_LABELS_SHORT <- c(
+  "1"="Mon", "2"="Tue", "3"="Wed",
+  "4"="Thu", "5"="Fri", "6"="Sat", "7"="Sun"
+)
+
+# Consistent year colours used across all plots
+YEAR_COLORS <- c(
+  "2004" = "#1565C0", "2005" = "#2E7D32",
+  "2006" = "#E65100", "2007" = "#6A1B9A", "2008" = "#C62828"
+)
+```
+
+------------------------------------------------------------------------
+
+# 2. Load Supplementary Lookup Tables {#lookups}
+
+**airports.csv** – IATA code → state, latitude, longitude. Used in Part
+C to add geographic features to each flight.
+
+**plane-data.csv** – Tail number → manufacture year. Used in Parts B and
+C to compute plane age.
+
+**carriers.csv** – IATA carrier code → full airline name. Loaded here
+and kept in memory so it is available throughout the notebook for
+carrier name resolution in Question C.
+
+All three files are small enough to load fully. `airports.csv` and
+`plane-data.csv` are stored as **named vectors** for O(1) lookups inside
+chunk loops. `carriers.csv` is stored as a named character vector indexed
+by IATA code.
+
+Where a tail number is not found in the plane lookup, the **global
+median manufacture year** is used as a fallback. This avoids discarding
+flights with unmatched tail numbers while keeping plane age reasonable.
+
+
+
+```{r lookup-tables}
+# airports.csv — loaded with fread (plain ASCII, no encoding issues)
+airports_raw <- fread(
+  file.path(DATA_DIR, "airports.csv"),
+  select = c("iata", "state", "lat", "long")
+)
+airports_raw <- airports_raw[!is.na(iata)]
+airports_raw[is.na(state), state := "Unknown"]
+airports_raw[, lat  := suppressWarnings(as.numeric(lat))]
+airports_raw[, long := suppressWarnings(as.numeric(long))]
+
+# Global mean coordinates — used when an IATA code is not in the lookup
+mean_lat <- mean(airports_raw$lat,  na.rm = TRUE)
+mean_lon <- mean(airports_raw$long, na.rm = TRUE)
+
+# Named vectors for fast in-loop lookup
+origin_state_lkp <- setNames(airports_raw$state, airports_raw$iata)
+origin_lat_lkp   <- setNames(airports_raw$lat,   airports_raw$iata)
+origin_lon_lkp   <- setNames(airports_raw$long,  airports_raw$iata)
+
+# plane-data.csv — loaded with read_csv to handle BOM / encoding reliably
+planes_raw <- read_csv(
+  file.path(DATA_DIR, "plane-data.csv"),
+  show_col_types = FALSE
+) %>%
+  dplyr::select(TailNum = tailnum, MfgYear = year) %>%
+  dplyr::mutate(MfgYear = suppressWarnings(as.numeric(MfgYear)))
+
+plane_lkp         <- setNames(planes_raw$MfgYear, planes_raw$TailNum)
+global_mfg_median <- median(planes_raw$MfgYear, na.rm = TRUE)
+
+# carriers.csv — IATA code → full airline name
+carriers_raw <- fread(file.path(DATA_DIR, "carriers.csv"), showProgress = FALSE)
+carriers_raw[, names(carriers_raw) := lapply(.SD, as.character)]
+code_col_r <- names(carriers_raw)[grepl("code", names(carriers_raw), ignore.case = TRUE)][1]
+name_col_r <- setdiff(names(carriers_raw), code_col_r)[1]
+carrier_name_lkp <- setNames(trimws(carriers_raw[[name_col_r]]),
+                              trimws(carriers_raw[[code_col_r]]))
+
+rm(airports_raw, planes_raw, carriers_raw)
+invisible(gc())
+```
+
+------------------------------------------------------------------------
+
+# 3. Shared Feature Engineering (Question C) {#feature-engineering}
+
+This section defines the feature set and helper functions used
+throughout Question C. All feature engineering is centralised here so
+the same logic applies consistently across training years, the test
+year, and the EDA sample.
+
+Two design choices are worth noting upfront. First, only columns
+available **before** a flight departs are included — post-flight
+fields like `WeatherDelay` or `ArrDelay` are excluded to prevent data
+leakage into the diversion model. Second, geographic coordinates for
+both origin and destination airports are added as continuous features,
+allowing the model to pick up any spatial patterns in diversion risk
+without one-hot encoding every individual airport.
+
+## Feature lists
+
+```{r feature-lists}
+# Numeric features — standardised (z-score) before modelling
+NUMERIC_FEATURES_C <- c(
+  "Distance", "PlaneAge",
+  "Month", "DayofMonth", "DayOfWeek",
+  "DepHour", "ArrHour",
+  "Origin_Lat", "Origin_Lon",
+  "Dest_Lat",   "Dest_Lon"
+)
+
+# Categorical features — one-hot encoded via sparse.model.matrix
+CAT_FEATURES_C <- c("UniqueCarrier", "Origin_State", "Dest_State")
+ALL_FEATURES_C <- c(NUMERIC_FEATURES_C, CAT_FEATURES_C)
+
+# Columns to read from the raw CSV (minimal set to reduce memory)
+COLS_NEEDED_C <- c(
+  "Month", "DayofMonth", "DayOfWeek",
+  "CRSDepTime", "CRSArrTime",
+  "UniqueCarrier", "TailNum",
+  "Origin", "Dest", "Distance", "Diverted"
+)
+```
+
+## `engineer_chunk()`
+
+Takes a raw `data.table` chunk and returns it with all model features
+attached. Each transformation is applied in place to avoid unnecessary
+copies. Key steps are:
+
+- **Departure and arrival hour** are extracted from the 4-digit HHMM
+  scheduled time fields (`CRSDepTime`, `CRSArrTime`) using integer
+  division, then wrapped modulo 24 to handle the edge case of midnight
+  schedules stored as 2400.
+- **Origin and destination features** (state, latitude, longitude) are
+  added via O(1) named-vector lookups against the airport table loaded
+  in Section 2. Missing IATA codes fall back to the global mean
+  coordinates rather than producing NA values that would break the
+  sparse matrix construction.
+- **Plane age** is computed as `flight_year − MfgYear`, then clipped to
+  the interval [0, 80] to remove implausible values caused by data
+  entry errors in the tail-number registry.
+
+```{r engineer-chunk-fn}
+#' Add model features to a raw chunk of flight data
+#'
+#' @param chunk       data.table of raw flight rows
+#' @param flight_year integer year of the flights (used to compute PlaneAge)
+#' @return data.table with ALL_FEATURES_C + Diverted, or NULL if the chunk is empty
+engineer_chunk <- function(chunk, flight_year) {
+  dt <- copy(chunk)
+
+  # Drop rows where the target is missing
+  dt <- dt[!is.na(Diverted)]
+  if (nrow(dt) == 0L) return(NULL)
+
+  dt[, Diverted := as.integer(Diverted)]
+
+  # Departure and arrival hour from 4-digit HHMM format (e.g. 1435 → 14)
+  dt[, DepHour := (as.integer(fifelse(is.na(CRSDepTime), 0L,
+                                       as.integer(CRSDepTime))) %/% 100L) %% 24L]
+  dt[, ArrHour := (as.integer(fifelse(is.na(CRSArrTime), 0L,
+                                       as.integer(CRSArrTime))) %/% 100L) %% 24L]
+
+  # Distance — coerce to numeric, fill missing with 0
+  dt[, Distance := {
+    d <- suppressWarnings(as.numeric(Distance))
+    fifelse(is.na(d), 0, d)
+  }]
+
+  # Origin airport: state and coordinates via named-vector lookup
+  dt[, Origin_State := fifelse(is.na(origin_state_lkp[Origin]), "Unknown",
+                                 origin_state_lkp[Origin])]
+  dt[, Origin_Lat   := fifelse(is.na(origin_lat_lkp[Origin]),   mean_lat,
+                                 origin_lat_lkp[Origin])]
+  dt[, Origin_Lon   := fifelse(is.na(origin_lon_lkp[Origin]),   mean_lon,
+                                 origin_lon_lkp[Origin])]
+
+  # Destination airport — same lookups
+  dt[, Dest_State := fifelse(is.na(origin_state_lkp[Dest]), "Unknown",
+                               origin_state_lkp[Dest])]
+  dt[, Dest_Lat   := fifelse(is.na(origin_lat_lkp[Dest]),   mean_lat,
+                               origin_lat_lkp[Dest])]
+  dt[, Dest_Lon   := fifelse(is.na(origin_lon_lkp[Dest]),   mean_lon,
+                               origin_lon_lkp[Dest])]
+
+  # Plane age: flight year minus manufacture year, clipped to [0, 80]
+  mfg <- plane_lkp[dt$TailNum]
+  mfg[is.na(mfg)] <- global_mfg_median
+  dt[, PlaneAge := pmax(pmin(flight_year - mfg, 80), 0)]
+
+  # Cast calendar and time fields to integer
+  for (col in c("Month", "DayofMonth", "DayOfWeek", "DepHour", "ArrHour")) {
+    dt[, (col) := as.integer(get(col))]
+  }
+
+  dt[, c(ALL_FEATURES_C, "Diverted"), with = FALSE]
+}
+```
+
+## `load_year_sampled_c()`
+
+Reads a full year file in chunks via `fread(skip, nrows)`, keeps **all
+diverted flights**, and randomly samples non-diverted flights to fill
+the remainder of `target_size`.
+
+Because diverted flights represent less than 0.3% of all records, a
+naive random sample of the raw file would produce a dataset that is
+almost entirely non-diverted. By retaining every diversion and
+downsampling the majority class, the function produces a stratified
+dataset that gives the logistic regression a meaningful signal to learn
+from. The same strategy is applied consistently across all five years so
+coefficient estimates are comparable.
+
+```{r load-year-sampled-fn}
+#' Load a stratified sample from one year's CSV
+#'
+#' @param year        integer year (2004–2008)
+#' @param target_size maximum total rows returned (defaults to global SAMPLE_SIZE)
+#' @return data.table, or NULL if no diverted flights were found
+load_year_sampled_c <- function(year, target_size = SAMPLE_SIZE) {
+  path <- file.path(DATA_DIR, paste0(year, ".csv"))
+
+  # Read header once to get column names and positions
+  header_dt  <- fread(path, nrows = 0L)
+  all_cols   <- names(header_dt)
+  needed_idx <- which(all_cols %in% COLS_NEEDED_C)
+  needed_nms <- all_cols[needed_idx]
+
+  div_list    <- list()
+  nondiv_list <- list()
+  total_rows  <- 0L
+  skip_lines  <- 1L
+
+  repeat {
+    chunk <- tryCatch(
+      fread(path,
+            skip         = skip_lines,
+            nrows        = CHUNK_SIZE,
+            header       = FALSE,
+            select       = needed_idx,
+            col.names    = needed_nms,
+            showProgress = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(chunk) || nrow(chunk) == 0L) break
+
+    n_read <- nrow(chunk)
+    eng    <- engineer_chunk(chunk, year)
+    rm(chunk); invisible(gc())
+
+    if (!is.null(eng) && nrow(eng) > 0L) {
+      total_rows  <- total_rows + nrow(eng)
+      div_list    <- c(div_list,    list(eng[Diverted == 1L]))
+      nondiv_list <- c(nondiv_list, list(eng[Diverted == 0L]))
+      rm(eng)
+    }
+    invisible(gc())
+
+    if (n_read < CHUNK_SIZE) break
+    skip_lines <- skip_lines + CHUNK_SIZE
+  }
+
+  if (length(div_list) == 0L ||
+      sum(vapply(div_list, nrow, integer(1L))) == 0L) {
+    return(NULL)
+  }
+
+  all_div    <- rbindlist(div_list,    fill = TRUE)
+  all_nondiv <- rbindlist(nondiv_list, fill = TRUE)
+  rm(div_list, nondiv_list); invisible(gc())
+
+  n_div    <- nrow(all_div)
+  n_sample <- max(0L, min(target_size - n_div, nrow(all_nondiv)))
+
+  sampled <- rbindlist(list(
+    all_div,
+    all_nondiv[sample(.N, size = n_sample)]
+  ))
+  sampled <- sampled[sample(.N)]
+
+  rm(all_div, all_nondiv); invisible(gc())
+
+  sampled
+}
+```
+
+## Modelling helpers
+
+Two functions handle all model fitting and scoring.
+
+`fit_logreg()` standardises numeric features using z-scores computed
+from the training data, one-hot encodes the three categorical features
+via a sparse model matrix, and fits ridge logistic regression (`glmnet`,
+α = 0) with λ = 1/(2n). Balanced class weights are applied so the rare
+diversion class is not overwhelmed by the majority non-diversion class.
+The function returns the fitted model alongside the normalisation
+parameters (`prep`) so the same scaling can be applied consistently to
+new data.
+
+`predict_prob()` applies the stored `prep` parameters to new data,
+constructs the matching sparse matrix, pads any columns that were
+present in training but absent in the new data with zeros, and returns
+predicted probabilities.
+
+```{r model-helpers}
+# Balanced class weights
+balanced_weights <- function(y) {
+  n     <- length(y)
+  n_pos <- sum(y == 1L)
+  n_neg <- sum(y == 0L)
+  ifelse(y == 1L, n / (2 * n_pos), n / (2 * n_neg))
+}
+
+# Ridge logistic regression (glmnet, alpha=0, lambda = 1/(2n))
+fit_logreg <- function(X_dt, y, prep = NULL) {
+  dt <- copy(X_dt[, ALL_FEATURES_C, with = FALSE])
+
+  # Standardise numeric features (z-score)
+  if (is.null(prep)) {
+    prep <- lapply(setNames(NUMERIC_FEATURES_C, NUMERIC_FEATURES_C), function(col) {
+      m <- mean(dt[[col]], na.rm = TRUE)
+      s <- sd(dt[[col]],   na.rm = TRUE)
+      if (is.na(s) || s == 0) s <- 1
+      c(mean = m, sd = s)
+    })
+  }
+  for (col in NUMERIC_FEATURES_C) {
+    dt[[col]] <- (as.numeric(dt[[col]]) - prep[[col]]["mean"]) / prep[[col]]["sd"]
+  }
+
+  # Convert categoricals to factors 
+  for (col in CAT_FEATURES_C) {
+    dt[[col]] <- as.factor(as.character(dt[[col]]))
+  }
+
+  # Sparse model matrix (one-hot encoding)
+  X_mat <- sparse.model.matrix(~ . - 1, data = dt)
+
+  # Balanced class weights
+  w <- balanced_weights(y)
+
+  # Fit ridge logistic regression
+  lambda_val <- 1 / (2 * nrow(X_mat))
+
+  model <- glmnet(
+    X_mat, y,
+    family      = "binomial",
+    alpha       = 0,
+    lambda      = lambda_val,
+    weights     = w,
+    standardize = FALSE,
+    thresh      = 1e-5,
+    maxit       = 2000L
+  )
+
+  coef_mat <- coef(model, s = lambda_val)
+  coef_vec <- as.vector(coef_mat)[-1]
+  names(coef_vec) <- rownames(coef_mat)[-1]
+
+  list(
+    model      = model,
+    coef_vec   = coef_vec,
+    feat_names = names(coef_vec),
+    prep       = prep,
+    lambda     = lambda_val,
+    X_mat      = X_mat
+  )
+}
+
+# Apply fitted model to new data
+predict_prob <- function(fit_result, X_dt) {
+  dt <- copy(X_dt[, ALL_FEATURES_C, with = FALSE])
+
+  for (col in NUMERIC_FEATURES_C) {
+    dt[[col]] <- (as.numeric(dt[[col]]) - fit_result$prep[[col]]["mean"]) /
+                  fit_result$prep[[col]]["sd"]
+  }
+  for (col in CAT_FEATURES_C) {
+    dt[[col]] <- as.factor(as.character(dt[[col]]))
+  }
+
+  X_new <- sparse.model.matrix(~ . - 1, data = dt)
+
+  train_cols <- colnames(fit_result$X_mat)
+  missing    <- setdiff(train_cols, colnames(X_new))
+  if (length(missing) > 0L) {
+    pad <- Matrix(0, nrow = nrow(X_new), ncol = length(missing), sparse = TRUE)
+    colnames(pad) <- missing
+    X_new <- cbind(X_new, pad)
+  }
+  X_new <- X_new[, train_cols, drop = FALSE]
+
+  as.vector(predict(fit_result$model, newx = X_new,
+                     s = fit_result$lambda, type = "response"))
+}
+```
+
+------------------------------------------------------------------------
+
+# 4. Question A – Best Times and Days to Minimise Delays {#question-a}
+
+## Research Question
+
+What combination of day of the week and departure hour gives the lowest
+average arrival delay, and does this pattern change from 2004 to 2008?
+
+## Approach
+
+**Why arrival delay?** It measures the passenger experience directly —
+a flight that lands late is a delay that the passenger actually
+feels, regardless of whether it departed on time.
+
+**Why group by scheduled departure hour?** Delays accumulate across the
+day — a flight departing at 06:00 faces an uncongested system, while one
+at 19:00 has inherited disruptions from all earlier flights. Analysing
+by departure hour captures this compounding effect without needing to
+model it explicitly.
+
+Cancelled flights are excluded from all delay calculations since they
+have no recorded arrival delay. Each year is processed independently so
+that year-on-year shifts in the pattern can be identified clearly.
+
+```{r q-a-load}
+COLS_NEEDED_A <- c("DayOfWeek", "CRSDepTime", "ArrDelay", "Cancelled")
+
+yearly_agg     <- list()
+yearly_day     <- list()
+yearly_hour    <- list()
+summary_rows_a <- list()
+
+for (y in YEARS) {
+  path <- file.path(DATA_DIR, paste0(y, ".csv"))
+
+  year_dt <- fread(path, select = COLS_NEEDED_A, showProgress = FALSE)
+
+  year_dt <- year_dt[Cancelled != 1 & !is.na(ArrDelay)]
+  year_dt[, ArrDelay := suppressWarnings(as.numeric(ArrDelay))]
+  year_dt <- year_dt[!is.na(ArrDelay)]
+
+  year_dt[, DepHour := (as.integer(fifelse(is.na(CRSDepTime), 0L,
+                                            as.integer(CRSDepTime))) %/% 100L) %% 24L]
+
+  heatmap_dt <- year_dt[, .(AvgDelay = mean(ArrDelay), FlightCount = .N),
+                          by = .(DayOfWeek, DepHour)]
+  yearly_agg[[as.character(y)]] <- heatmap_dt
+
+  day_dt <- year_dt[, .(AvgDelay = mean(ArrDelay), FlightCount = .N), by = DayOfWeek]
+  day_dt[, DayName := DAY_LABELS[as.character(DayOfWeek)]]
+  yearly_day[[as.character(y)]] <- day_dt
+
+  hour_dt <- year_dt[, .(AvgDelay = mean(ArrDelay), FlightCount = .N), by = DepHour]
+  yearly_hour[[as.character(y)]] <- hour_dt
+
+  best  <- heatmap_dt[which.min(AvgDelay)]
+  worst <- heatmap_dt[which.max(AvgDelay)]
+
+  summary_rows_a[[length(summary_rows_a) + 1L]] <- list(
+    Year                    = y,
+    `Best Day`              = DAY_LABELS[as.character(best$DayOfWeek)],
+    `Best Hour`             = sprintf("%02d:00", best$DepHour),
+    `Best Avg Delay (min)`  = round(best$AvgDelay, 2),
+    `Worst Day`             = DAY_LABELS[as.character(worst$DayOfWeek)],
+    `Worst Hour`            = sprintf("%02d:00", worst$DepHour),
+    `Worst Avg Delay (min)` = round(worst$AvgDelay, 2)
+  )
+
+  rm(year_dt, day_dt, hour_dt); invisible(gc())
+}
+
+summary_a <- rbindlist(summary_rows_a)
+knitr::kable(summary_a, caption = "Summary of Best and Worst Times to Fly (2004–2008)")
+```
+
+## Question A – Plots
+
+The heatmap below shows average arrival delay for every
+day-of-week × departure-hour combination. A shared colour scale is used
+across all five years so changes over time are directly comparable. The
+star marks the single best slot per year. The bar charts underneath
+break the same data into marginal views — one bar per day and one bar
+per hour — to make the dominant patterns easier to read.
+
+```{r q-a-heatmap, fig.width=14, fig.height=5}
+all_delays <- unlist(lapply(yearly_agg, `[[`, "AvgDelay"))
+vmin <- quantile(all_delays, 0.05)
+vmax <- quantile(all_delays, 0.95)
+
+make_heatmap_panel <- function(y) {
+  hm       <- yearly_agg[[as.character(y)]]
+  best_row <- hm[which.min(AvgDelay)]
+
+  ggplot(hm, aes(x = DepHour,
+                  y = factor(DayOfWeek, levels = 7:1),
+                  fill = AvgDelay)) +
+    geom_tile(color = "grey95", linewidth = 0.2) +
+    geom_point(data = best_row,
+               aes(x = DepHour, y = factor(DayOfWeek, levels = 7:1)),
+               color = "white", shape = 8, size = 3, stroke = 1.5,
+               inherit.aes = FALSE) +
+    scale_fill_gradientn(
+      colors = c("#2E7D32", "#FFEB3B", "#C62828"),
+      limits = c(vmin, vmax),
+      oob    = squish,
+      name   = "Avg Delay\n(min)"
+    ) +
+    scale_x_continuous(breaks = c(0, 6, 12, 18, 23),
+                       labels = c("00", "06", "12", "18", "23")) +
+    scale_y_discrete(labels = rev(DAY_LABELS_SHORT)) +
+    labs(title = as.character(y), x = "Departure Hour", y = NULL) +
+    theme_minimal(base_size = 9) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 12))
+}
+
+heatmap_panels <- lapply(YEARS, make_heatmap_panel)
+
+fig1 <- wrap_plots(heatmap_panels, nrow = 1) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Average Arrival Delay by Day of Week and Departure Hour (2004–2008)",
+    subtitle = "Star = best slot per year.  Green = low delay,  Red = high delay.",
+    theme    = theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 10)
+    )
+  )
+print(fig1)
+```
+
+```{r q-a-bar-charts, fig.width=14, fig.height=16}
+make_bar_pair <- function(y) {
+  day_df  <- copy(yearly_day[[as.character(y)]][order(DayOfWeek)])
+  hour_df <- copy(yearly_hour[[as.character(y)]][order(DepHour)])
+
+  best_day_idx <- which.min(day_df$AvgDelay)
+  best_hr_idx  <- which.min(hour_df$AvgDelay)
+
+  day_df[,  fill_col := "#2196F3"]
+  day_df[best_day_idx, fill_col := "#2E7D32"]
+  hour_df[, fill_col := "#FF9800"]
+  hour_df[best_hr_idx, fill_col := "#2E7D32"]
+
+  p_day <- ggplot(day_df,
+                   aes(x = factor(DayOfWeek, levels = 1:7, labels = unname(DAY_LABELS)),
+                       y = AvgDelay, fill = fill_col)) +
+    geom_col(color = "white") +
+    geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5, linewidth = 0.8) +
+    scale_fill_identity() +
+    labs(title = sprintf("%d – By Day of Week", y),
+         x = NULL, y = "Avg Arrival Delay (min)") +
+    theme_minimal(base_size = 9) +
+    theme(axis.text.x  = element_text(angle = 30, hjust = 1),
+          plot.title    = element_text(face = "bold"),
+          panel.grid.major.x = element_blank())
+
+  best_hr_val <- hour_df$DepHour[best_hr_idx]
+  p_hour <- ggplot(hour_df, aes(x = DepHour, y = AvgDelay, fill = fill_col)) +
+    geom_col(color = "white") +
+    geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5, linewidth = 0.8) +
+    scale_fill_identity() +
+    scale_x_continuous(breaks = c(0, 3, 6, 9, 12, 15, 18, 21, 23)) +
+    labs(title = sprintf("%d – By Hour (green = best: %02d:00)", y, best_hr_val),
+         x = "Hour of Day", y = "Avg Arrival Delay (min)") +
+    theme_minimal(base_size = 9) +
+    theme(plot.title = element_text(face = "bold"))
+
+  list(p_day, p_hour)
+}
+
+bar_pairs  <- lapply(YEARS, make_bar_pair)
+row_panels <- lapply(bar_pairs, function(pr) pr[[1]] | pr[[2]])
+
+fig2 <- wrap_plots(row_panels, ncol = 1) +
+  plot_annotation(
+    title    = "Average Arrival Delay by Day and Hour per Year (2004–2008)",
+    subtitle = "Green bar = lowest average delay for that year",
+    theme    = theme(plot.title = element_text(face = "bold", size = 13))
+  )
+print(fig2)
+```
+
+## Question A – Findings
+
+Early morning flights on **Tuesdays and Wednesdays** consistently had
+the lowest average arrival delays across all five years. Departures
+around **06:00–07:00** performed best because delay effects from earlier
+flights have not yet accumulated across the aviation network. Negative
+average delays in the best slots indicate that these flights
+characteristically land ahead of their scheduled arrival time.
+
+The worst departure times were **Thursday and Friday evenings
+(18:00–21:00)**, driven by peak passenger traffic before the weekend and
+the compounding of disruptions from earlier in the day. The gap between
+the best and worst slots widened noticeably in 2006 and 2007, suggesting
+that the network was under greater strain during those years.
+
+This pattern was **stable across all five years**, giving clear and
+actionable advice to passengers: book early-morning midweek departures
+and avoid Friday evening travel.
+
+------------------------------------------------------------------------
+
+# 5. Question B – Do Older Planes Suffer More Delays? {#question-b}
+
+## Approach
+
+To test whether aircraft age is associated with higher arrival delays,
+plane age is computed as `flight_year − MfgYear` and clipped to [0, 80]
+years to remove spurious values caused by data entry errors in the
+tail-number registry. Flights are then grouped into six age bands
+(0–5, 5–10, 10–15, 15–20, 20–25, 25+) and the mean arrival delay is
+computed within each band for each year.
+
+In addition to the grouped analysis, Pearson correlation is calculated
+on a random sample of 100,000 individual flights per year. Sampling
+rather than using the full dataset keeps computation manageable while
+still providing a stable estimate of the linear relationship between
+continuous plane age and delay.
+
+```{r q-b-load}
+COLS_NEEDED_B <- c("TailNum", "ArrDelay", "Cancelled")
+AGE_BREAKS    <- c(0, 5, 10, 15, 20, 25, 100)
+AGE_LABELS    <- c("0-5", "5-10", "10-15", "15-20", "20-25", "25+")
+
+age_bin_results <- list()
+corr_results_b  <- list()
+raw_age_delay   <- list()
+
+for (y in YEARS) {
+  path <- file.path(DATA_DIR, paste0(y, ".csv"))
+
+  year_dt <- fread(path, select = COLS_NEEDED_B, showProgress = FALSE)
+  year_dt <- year_dt[Cancelled != 1 & !is.na(ArrDelay) & !is.na(TailNum)]
+  year_dt[, ArrDelay := suppressWarnings(as.numeric(ArrDelay))]
+  year_dt <- year_dt[!is.na(ArrDelay)]
+
+  mfg <- plane_lkp[year_dt$TailNum]
+  mfg[is.na(mfg)] <- global_mfg_median
+  year_dt[, PlaneAge := pmax(pmin(y - mfg, 80), 0)]
+
+  year_dt[, AgeBin := cut(PlaneAge, breaks = AGE_BREAKS, labels = AGE_LABELS,
+                            right = FALSE, include.lowest = TRUE)]
+
+  bin_agg <- year_dt[, .(AvgDelay = mean(ArrDelay), Count = .N), by = AgeBin]
+  bin_agg[, Year := y]
+  age_bin_results[[as.character(y)]] <- bin_agg
+
+  n_samp <- min(100000L, nrow(year_dt))
+  samp   <- year_dt[sample(.N, n_samp)]
+  corr   <- cor(samp$PlaneAge, samp$ArrDelay, use = "complete.obs")
+  corr_results_b[[as.character(y)]] <- corr
+
+  age_avg <- year_dt[, .(AvgDelay = mean(ArrDelay), Count = .N), by = PlaneAge]
+  raw_age_delay[[as.character(y)]] <- age_avg[Count >= 100]
+
+  rm(year_dt, samp, bin_agg, age_avg); invisible(gc())
+}
+
+corr_dt_b <- data.table(
+  Year        = as.integer(names(corr_results_b)),
+  PearsonCorr = unlist(corr_results_b)
+)
+knitr::kable(corr_dt_b, caption = "Pearson Correlation: Plane Age vs Arrival Delay (2004–2008)")
+```
+
+## Question B – Plots
+
+The left panel shows the average arrival delay for each age group across
+all five years on a single line chart. The right panel shows the Pearson
+correlation coefficient for each year. Red bars indicate a positive
+correlation (older = more delayed); blue would indicate a negative one.
+The scatter plots show the raw relationship at the level of individual
+plane-age values, with bubble size proportional to the number of flights
+at that age and a weighted trend line overlaid.
+
+```{r q-b-primary, fig.width=14, fig.height=6}
+bin_all <- rbindlist(age_bin_results)
+bin_all[, AgeBin := factor(AgeBin, levels = AGE_LABELS)]
+bin_all[, Year   := factor(Year)]
+
+# Local colour map for this line graph (alphabetical year order → prescribed scheme)
+LINE_YEAR_COLORS <- c(
+  "2004" = "#E53935",  # Red
+  "2005" = "#1E88E5",  # Blue
+  "2006" = "#FDD835",  # Yellow
+  "2007" = "#43A047",  # Green
+  "2008" = "#8E24AA"   # Purple
+)
+
+p_line <- ggplot(bin_all, aes(x = AgeBin, y = AvgDelay,
+                                color = Year, group = Year)) +
+  geom_line(linewidth = 2) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.4) +
+  scale_color_manual(values = LINE_YEAR_COLORS) +
+  labs(title  = "Average Arrival Delay by Plane Age Group per Year",
+       x = "Plane Age Group (years)", y = "Average Arrival Delay (minutes)",
+       color = "Year") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+corr_dt_b[, bar_color := ifelse(PearsonCorr > 0, "#E53935", "#1E88E5")]
+
+p_corr <- ggplot(corr_dt_b,
+                  aes(x = factor(Year), y = PearsonCorr, fill = bar_color)) +
+  geom_col(color = "white", width = 0.55) +
+  geom_text(aes(label   = sprintf("%.4f", PearsonCorr),
+                vjust   = ifelse(PearsonCorr >= 0, -0.4, 1.3)),
+            fontface = "bold", size = 3.5) +
+  geom_hline(yintercept = 0, linewidth = 0.8) +
+  scale_fill_identity() +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.12))) +
+  labs(title = "Correlation: Plane Age vs Arrival Delay per Year",
+       x = "Year", y = "Pearson Correlation (r)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+fig3 <- (p_line | p_corr) +
+  plot_annotation(
+    title = "Do Older Planes Suffer More Delays? (2004–2008)",
+    theme = theme(plot.title = element_text(face = "bold", size = 14))
+  )
+print(fig3)
+```
+
+```{r q-b-scatter, fig.width=14, fig.height=5}
+scatter_panels <- lapply(YEARS, function(y) {
+  df   <- raw_age_delay[[as.character(y)]]
+  corr <- corr_results_b[[as.character(y)]]
+
+  fit   <- lm(AvgDelay ~ PlaneAge, data = df, weights = Count)
+  df[, trend := predict(fit)]
+
+  ggplot(df, aes(x = PlaneAge, y = AvgDelay)) +
+    geom_point(aes(size = pmin(Count / 50000, 8)),
+               alpha = 0.6, color = YEAR_COLORS[as.character(y)],
+               stroke = 0.4) +
+    geom_line(aes(y = trend), color = "black", linewidth = 1.5,
+              linetype = "dashed", alpha = 0.7) +
+    geom_hline(yintercept = 0, color = "grey60", linetype = "dotted") +
+    scale_size_identity() +
+    labs(title = sprintf("%d\nr = %.3f", y, corr),
+         x = "Plane Age (years)",
+         y = if (y == 2004) "Avg Arrival Delay (min)" else NULL) +
+    theme_minimal(base_size = 9) +
+    theme(plot.title    = element_text(face = "bold", hjust = 0.5),
+          legend.position = "none")
+})
+
+fig4 <- wrap_plots(scatter_panels, nrow = 1) +
+  plot_annotation(
+    title    = "Average Arrival Delay vs Exact Plane Age per Year (2004–2008)",
+    subtitle = "Bubble size = number of flights.  Dashed line = trend.",
+    theme    = theme(plot.title = element_text(face = "bold", size = 13))
+  )
+print(fig4)
+```
+
+## Question B – Findings
+
+The Pearson correlation between plane age and arrival delay is
+**positive but weak** in all five years (r ≈ 0.01–0.02). Older planes do
+have slightly higher delays on average, but age explains very little of
+the total variation in delay — accounting for less than 0.04% of the
+variance (r²) in the worst year.
+
+The age-band line chart reinforces this: delay differences between the
+youngest and oldest aircraft are small relative to the year-on-year
+shifts in overall delay levels, which are driven by factors such as
+network congestion and weather rather than fleet age.
+
+**Carrier identity and route type have a far stronger influence on
+delays** than the age of the aircraft. A flight operated by an
+efficient carrier on a short, uncongested route will typically be less
+delayed than one operated on a busy hub route regardless of how old
+the plane is.
+
+------------------------------------------------------------------------
+
+# 6. Question C – Logistic Regression for Flight Diversion Probability {#question-c}
+
+A logistic regression model is fitted to predict whether a flight will
+be diverted, using only features that are known **before departure**.
+Two modelling challenges require explicit handling:
+
+**Data leakage:** `WeatherDelay` and other post-flight fields are
+excluded — they are recorded only after a flight lands and are almost
+always missing for diverted flights. Including them would let the model
+cheat by looking at information that would not be available at
+prediction time.
+
+**Class imbalance:** Diverted flights account for less than 0.3% of all
+records. This is handled via (1) stratified sampling in
+`load_year_sampled_c()`, which retains all diversions while
+downsampling non-diversions, and (2) balanced class weights inside
+`fit_logreg()`, which upweights the minority class during optimisation.
+
+## 6.1 EDA – Feature Selection {#eda}
+
+Before fitting any model, exploratory data analysis is run on the 2006
+dataset (chosen as a representative middle year) to understand how
+diversion rates vary across the candidate features. A sample of up to
+500,000 engineered rows is loaded in chunks, then randomly reduced to
+100,000 for the plots to keep rendering fast.
+
+Three bar charts examine how the raw diversion rate shifts across
+distance quartiles, departure hours, and days of the week. A
+correlation bar chart then ranks all numeric features by their absolute
+Pearson correlation with the binary `Diverted` target, distinguishing
+positive associations (red) from negative ones (blue). This ranking
+informs which features are likely to carry the most signal in the
+regression, though all features are retained since ridge
+regularisation will down-weight uninformative ones automatically.
+
+```{r q-c-eda-load}
+eda_path    <- file.path(DATA_DIR, "2006.csv")
+hdr         <- fread(eda_path, nrows = 0L)
+all_cols    <- names(hdr)
+needed_idx  <- which(all_cols %in% COLS_NEEDED_C)
+needed_nms  <- all_cols[needed_idx]
+
+eda_chunks  <- list()
+eda_total   <- 0L
+skip_lines  <- 1L
+
+repeat {
+  chunk <- tryCatch(
+    fread(eda_path, skip = skip_lines, nrows = CHUNK_SIZE, header = FALSE,
+          select = needed_idx, col.names = needed_nms, showProgress = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(chunk) || nrow(chunk) == 0L) break
+
+  n_read <- nrow(chunk)
+  eng    <- engineer_chunk(chunk, 2006L)
+  rm(chunk); invisible(gc())
+
+  if (!is.null(eng)) {
+    eda_chunks <- c(eda_chunks, list(eng))
+    eda_total  <- eda_total + nrow(eng)
+    rm(eng)
+  }
+
+  if (eda_total >= 500000L || n_read < CHUNK_SIZE) break
+  skip_lines <- skip_lines + CHUNK_SIZE
+}
+
+eda_dt <- rbindlist(eda_chunks, fill = TRUE)
+eda_dt <- eda_dt[sample(.N, min(100000L, .N))]
+rm(eda_chunks); invisible(gc())
+```
+
+```{r q-c-eda-plots, fig.width=14, fig.height=5}
+eda_dt[, DistBand := cut(
+  Distance,
+  breaks         = quantile(Distance, probs = c(0, .25, .5, .75, 1), na.rm = TRUE),
+  labels         = c("Short", "Medium", "Long", "Very Long"),
+  include.lowest = TRUE
+)]
+dist_div <- eda_dt[, .(DivertedRate = mean(Diverted) * 100), by = DistBand][order(DistBand)]
+
+p_eda1 <- ggplot(dist_div, aes(x = DistBand, y = DivertedRate)) +
+  geom_col(fill = "#1565C0", color = "white") +
+  labs(title = "Diversion Rate by Distance Band",
+       x = "Distance Quartile", y = "Diversion Rate (%)") +
+  theme_minimal(base_size = 10) +
+  theme(plot.title = element_text(face = "bold"))
+
+hour_div <- eda_dt[, .(DivertedRate = mean(Diverted) * 100), by = DepHour][order(DepHour)]
+
+p_eda2 <- ggplot(hour_div, aes(x = DepHour, y = DivertedRate)) +
+  geom_col(fill = "#E65100", color = "white") +
+  scale_x_continuous(breaks = c(0, 6, 12, 18, 23)) +
+  labs(title = "Diversion Rate by Departure Hour",
+       x = "Departure Hour", y = "Diversion Rate (%)") +
+  theme_minimal(base_size = 10) +
+  theme(plot.title = element_text(face = "bold"))
+
+dow_div <- eda_dt[, .(DivertedRate = mean(Diverted) * 100), by = DayOfWeek][order(DayOfWeek)]
+dow_div[, DayName := factor(DAY_LABELS_SHORT[as.character(DayOfWeek)],
+                              levels = DAY_LABELS_SHORT)]
+
+p_eda3 <- ggplot(dow_div, aes(x = DayName, y = DivertedRate)) +
+  geom_col(fill = "#2E7D32", color = "white") +
+  labs(title = "Diversion Rate by Day of Week",
+       x = "Day", y = "Diversion Rate (%)") +
+  theme_minimal(base_size = 10) +
+  theme(plot.title = element_text(face = "bold"))
+
+fig_eda <- (p_eda1 | p_eda2 | p_eda3) +
+  plot_annotation(
+    title = "EDA: Diversion Rate by Feature (2006 sample, n = 100,000)",
+    theme = theme(plot.title = element_text(face = "bold", size = 13))
+  )
+print(fig_eda)
+```
+
+```{r q-c-eda-correlations, fig.width=10, fig.height=5}
+corr_with_target <- sapply(NUMERIC_FEATURES_C, function(col) {
+  cor(eda_dt[[col]], eda_dt$Diverted, use = "complete.obs")
+})
+corr_dt_eda <- data.table(
+  Feature = names(corr_with_target),
+  AbsCorr = abs(corr_with_target),
+  RawCorr = corr_with_target
+)[order(-AbsCorr)]
+corr_dt_eda[, bar_color := ifelse(RawCorr > 0, "#E53935", "#1E88E5")]
+
+p_corr_eda <- ggplot(corr_dt_eda,
+                      aes(x = reorder(Feature, -AbsCorr), y = AbsCorr,
+                          fill = bar_color)) +
+  geom_col(color = "white") +
+  scale_fill_identity() +
+  labs(title = "Absolute Correlation of Numeric Features with Diverted (2006 sample)",
+       x = "Feature", y = "|Pearson r| with Diverted") +
+  theme_minimal(base_size = 10) +
+  theme(plot.title  = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_corr_eda)
+
+rm(eda_dt); invisible(gc())
+```
+
+## 6.2 Part A – Per-Year Coefficient Analysis {#q-c-part-a}
+
+A separate ridge logistic regression is fitted on each year's data
+independently. This lets us track how each feature's log-odds
+contribution to diversion risk changes over time — for example,
+whether the influence of flight distance or carrier identity became
+stronger or weaker as the network evolved between 2004 and 2008.
+
+Each year's model uses the stratified sample produced by
+`load_year_sampled_c()`. The coefficients are extracted and assembled
+into a long-format table (`coef_long`) with one row per feature per year,
+with missing coefficients (features that appear in some years but not
+others, typically due to sparse carrier encoding) filled with zero.
+
+```{r q-c-part-a}
+coefs_list  <- list()
+auc_train_c <- list()
+
+for (y in YEARS) {
+
+  sample_dt <- load_year_sampled_c(y, target_size = SAMPLE_SIZE)
+  if (is.null(sample_dt)) next
+
+  y_vec <- sample_dt$Diverted
+  X_dt  <- sample_dt[, ALL_FEATURES_C, with = FALSE]
+
+  fit <- fit_logreg(X_dt, y_vec)
+
+  probs     <- as.vector(predict(fit$model, newx = fit$X_mat,
+                                  s = fit$lambda, type = "response"))
+  roc_train <- roc(y_vec, probs, quiet = TRUE)
+  auc_val   <- as.numeric(auc(roc_train))
+  auc_train_c[[as.character(y)]] <- auc_val
+
+  coefs_list[[as.character(y)]] <- fit$coef_vec
+
+  rm(sample_dt, X_dt, y_vec, fit, probs, roc_train); invisible(gc())
+}
+
+all_feat_nms <- unique(unlist(lapply(coefs_list, names)))
+coef_dt <- data.table(Feature = all_feat_nms)
+for (y_chr in names(coefs_list)) {
+  cv <- coefs_list[[y_chr]]
+  coef_dt[[y_chr]] <- cv[coef_dt$Feature]
+}
+
+# Zero-fill NA coefficients (features absent in some years)
+year_cols <- setdiff(names(coef_dt), "Feature")
+for (col in year_cols) {
+  set(coef_dt, i = which(is.na(coef_dt[[col]])), j = col, value = 0)
+}
+
+coef_long <- melt(coef_dt, id.vars = "Feature",
+                   variable.name = "Year", value.name = "Coef")
+coef_long[, Year := as.integer(as.character(Year))]
+```
+
+## 6.3 Part B – Prediction on Unseen 2008 Data {#q-c-part-b}
+
+To assess whether the model generalises beyond its training period, a
+combined model is trained on 2004–2007 data and then evaluated on
+held-out 2008 flights. This is a strict temporal train/test split —
+the model never sees any 2008 data during training, which gives a
+realistic estimate of how well it would perform if deployed in practice.
+
+Each training year contributes up to 1,000,000 sampled rows (stratified
+as before). The test set is an independent stratified sample from 2008.
+Performance is reported as AUC-ROC (which is threshold-independent) as
+well as precision, recall, and F1 at a 0.5 decision threshold. Low
+precision and F1 are expected given the extreme class imbalance — fewer
+than 0.3% of flights are diverted — so AUC is the primary metric of
+interest.
+
+```{r q-c-part-b}
+train_frames <- list()
+for (y in TRAIN_YEARS) {
+  s <- load_year_sampled_c(y, target_size = 1000000L)
+  if (!is.null(s)) {
+    train_frames[[as.character(y)]] <- s
+    rm(s)
+  }
+  invisible(gc())
+}
+train_dt <- rbindlist(train_frames, fill = TRUE)
+rm(train_frames); invisible(gc())
+
+test_dt <- load_year_sampled_c(TEST_YEAR, target_size = 1000000L)
+
+if (is.null(test_dt)) {
+  stop(sprintf(
+    "No diverted flights found in %d — cannot evaluate prediction model.", TEST_YEAR
+  ))
+}
+
+X_train <- train_dt[, ALL_FEATURES_C, with = FALSE]
+y_train <- train_dt$Diverted
+X_test  <- test_dt[, ALL_FEATURES_C, with = FALSE]
+y_test  <- test_dt$Diverted
+
+pred_fit <- fit_logreg(X_train, y_train)
+y_prob   <- predict_prob(pred_fit, X_test)
+y_pred   <- as.integer(y_prob > 0.5)
+
+roc_obj  <- roc(y_test, y_prob, quiet = TRUE)
+test_auc <- as.numeric(auc(roc_obj))
+
+tp <- sum(y_pred == 1L & y_test == 1L)
+fp <- sum(y_pred == 1L & y_test == 0L)
+fn <- sum(y_pred == 0L & y_test == 1L)
+tn <- sum(y_pred == 0L & y_test == 0L)
+
+test_prec <- ifelse(tp + fp > 0, tp / (tp + fp), 0)
+test_rec  <- ifelse(tp + fn > 0, tp / (tp + fn), 0)
+test_f1   <- ifelse(test_prec + test_rec > 0,
+                     2 * test_prec * test_rec / (test_prec + test_rec), 0)
+
+roc_df <- data.table(fpr = 1 - roc_obj$specificities,
+                      tpr = roc_obj$sensitivities)
+
+results_table <- data.table(
+  Metric = c("AUC-ROC", "Recall", "Precision", "F1 Score"),
+  Value = c(test_auc, test_rec, test_prec, test_f1)
+)
+knitr::kable(results_table, caption = "Model Performance on Unseen 2008 Test Data", digits = 4)
+
+confusion_matrix <- matrix(c(tn, fn, fp, tp), nrow = 2,
+                           dimnames = list(Actual = c("0","1"), Predicted = c("0","1")))
+knitr::kable(confusion_matrix, caption = "Confusion Matrix: Test Set (2008)")
+
+rm(train_dt, X_train, y_train); invisible(gc())
+```
+
+## 6.4 Plots {#q-c-plots}
+
+Four visualisations are produced for Question C:
+
+1.  **Coefficient trends (numeric features)** – how each standardised
+    numeric feature's log-odds contribution shifts year to year.
+2.  **ROC curve** – model discrimination on the held-out 2008 test set.
+3.  **Carrier heatmap** – per-carrier coefficients across all five years.
+4.  **Carrier diversion table** – full airline names resolved from
+    `carrier_name_lkp` (loaded at setup) and ranked by diversion rate.
+
+```{r q-c-coef-trends, fig.width=13, fig.height=7}
+plot_num_cols <- setdiff(NUMERIC_FEATURES_C,
+                          c("Origin_Lat", "Origin_Lon", "Dest_Lat", "Dest_Lon"))
+
+# Alphabetical feature order → prescribed colour scheme
+FEATURE_COLORS <- c(
+  "ArrHour"    = "#E53935",  # 1 Red
+  "DayofMonth" = "#1E88E5",  # 2 Blue
+  "DayOfWeek"  = "#FDD835",  # 3 Yellow
+  "DepHour"    = "#43A047",  # 4 Green
+  "Distance"   = "#8E24AA",  # 5 Purple
+  "Month"      = "#E91E63",  # 6 Pink
+  "PlaneAge"   = "#795548"   # 7 Brown
+)
+
+coef_trends_num <- coef_long[Feature %in% plot_num_cols]
+coef_trends_num[, Feature := factor(Feature, levels = sort(unique(Feature)))]
+labels_dt       <- coef_trends_num[Year == max(Year)]
+
+p5 <- ggplot(coef_trends_num,
+              aes(x = Year, y = Coef, color = Feature, group = Feature)) +
+  geom_line(linewidth = 2) +
+  geom_point(size = 3) +
+  geom_text(data  = labels_dt,
+            aes(label = sprintf("%.3f", Coef)),
+            hjust = -0.2, size = 2.8, show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.4) +
+  scale_x_continuous(breaks = YEARS, expand = expansion(mult = c(0.02, 0.14))) +
+  scale_color_manual(values = FEATURE_COLORS) +
+  labs(
+    title    = "Logistic Regression Coefficients – Numeric Features (2004–2008)",
+    subtitle = paste0(
+      "Positive = increases diversion probability.  Negative = decreases it.\n",
+      "Features standardised before fitting."
+    ),
+    x = "Year", y = "Coefficient Value (beta)", color = "Feature"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9),
+        legend.position = "right")
+
+print(p5)
+```
+
+```{r q-c-roc, fig.width=8, fig.height=7}
+p6 <- ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_ribbon(aes(ymin = 0, ymax = tpr), fill = "#1565C0", alpha = 0.07) +
+  geom_line(color = "#1565C0", linewidth = 2.5) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "black", alpha = 0.5) +
+  annotate("label",
+           x     = 0.72, y = 0.26,
+           label = sprintf("AUC       = %.4f\nRecall    = %.4f\nPrecision = %.4f\nF1        = %.4f",
+                            test_auc, test_rec, test_prec, test_f1),
+           hjust = 0, size = 3.8, fill = "white", color = "grey30",
+           label.size = 0.3) +
+  labs(
+    title    = "ROC Curve – Predicting Flight Diversions",
+    subtitle = sprintf("Trained on 2004–2007.  Tested on unseen %d data.", TEST_YEAR),
+    x = "False Positive Rate", y = "True Positive Rate (Recall)"
+  ) +
+  coord_equal() +
+  theme_minimal(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(size = 10))
+
+print(p6)
+```
+
+```{r q-c-carrier-heatmap, fig.height=10}
+carrier_dt <- coef_long[grepl("^UniqueCarrier", Feature)]
+carrier_dt[, Carrier := sub("UniqueCarrier", "", Feature)]
+
+# Sort carriers by mean coefficient value (highest diversion tendency at top)
+carrier_means_order <- carrier_dt[, .(MeanCoef = mean(Coef, na.rm = TRUE)), by = Carrier]
+carrier_means_order <- carrier_means_order[order(MeanCoef)]          # low → high
+carrier_dt[, Carrier := factor(Carrier, levels = carrier_means_order$Carrier)]  # high at top
+
+abs_max <- quantile(abs(carrier_dt$Coef), 0.95, na.rm = TRUE)
+
+p7 <- ggplot(carrier_dt, aes(x = factor(Year), y = Carrier, fill = Coef)) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = sprintf("%.2f", Coef),
+        color = ifelse(abs(Coef) > abs_max * 0.55, "white", "black")),
+    size = 2.5
+  ) +
+  scale_fill_gradientn(
+    colors = rev(brewer.pal(11, "RdBu")),
+    limits = c(-1, 1),
+    oob    = squish,
+    name   = "Coefficient\n(beta)"
+  ) +
+  scale_color_identity() +
+  labs(
+    title    = "Carrier Coefficients for Flight Diversion (2004–2008)",
+    subtitle = "Carriers sorted by mean diversion tendency (high → low).  Red = higher.  Blue = lower.",
+    x = "Year", y = "Carrier Code (high → low diversion tendency)"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(plot.title = element_text(face = "bold"))
+
+print(p7)
+```
+
+### Carrier Diversion Rate Table
+
+Maps IATA codes to full airline names using `carrier_name_lkp` loaded at
+setup, then identifies the carriers with the highest and lowest mean
+diversion coefficient across 2004–2008.
+
+```{r q-c-carrier-names}
+# Uses carrier_name_lkp loaded in Section 2 (no re-read of carriers.csv)
+carrier_means <- carrier_dt[, .(MeanCoef = mean(Coef, na.rm = TRUE)),
+                             by = Carrier][order(MeanCoef)]
+
+highest_code <- carrier_means[.N, Carrier]
+lowest_code  <- carrier_means[1L, Carrier]
+
+highest_name <- carrier_name_lkp[highest_code]
+lowest_name  <- carrier_name_lkp[lowest_code]
+if (is.na(highest_name)) highest_name <- highest_code
+if (is.na(lowest_name))  lowest_name  <- lowest_code
+
+highest_coef <- carrier_means[.N, MeanCoef]
+lowest_coef  <- carrier_means[1L, MeanCoef]
+
+carrier_summary <- data.frame(
+  Tendency       = c("Highest diversion tendency", "Lowest diversion tendency"),
+  `Carrier Code` = c(highest_code, lowest_code),
+  `Airline Name` = c(highest_name, lowest_name),
+  `Mean Beta`    = round(c(highest_coef, lowest_coef), 4),
+  check.names    = FALSE
+)
+knitr::kable(
+  carrier_summary,
+  caption = "Carriers with extreme diversion tendencies – mean coefficient across 2004–2008.",
+  align   = c("l", "c", "l", "r")
+)
+```
+
+```{r q-c-state-maps, fig.width=14, fig.height=10}
+shapefile_path <- file.path(BASE_DIR, "data", "shapefiles", "cb_2024_us_state_500k.shp")
+
+us <- tryCatch({
+  sf_obj <- st_read(shapefile_path, quiet = TRUE)
+  sf_obj[!is.na(sf_obj$STUSPS), ]
+}, error = function(e) {
+  cat(sprintf("Shapefile not found or error: %s\nState maps skipped.\n", e$message))
+  NULL
+})
+
+if (!is.null(us)) {
+  plot_state_map <- function(feature_prefix, title_str, filename) {
+    state_coefs <- coef_long[grepl(paste0("^", feature_prefix), Feature)]
+    state_coefs[, State := sub(feature_prefix, "", Feature)]
+    state_avg <- state_coefs[, .(coef_val = mean(abs(Coef), na.rm = TRUE)), by = State]
+
+    merged      <- dplyr::left_join(us, state_avg, by = c("STUSPS" = "State"))
+    merged_cont <- merged[!merged$STUSPS %in%
+                            c("AK","HI","PR","VI","GU","MP","AS"), ]
+
+    valid_vals <- state_avg$coef_val
+    vmin_s <- quantile(valid_vals, 0.05, na.rm = TRUE)
+    vmax_s <- quantile(valid_vals, 0.95, na.rm = TRUE)
+
+    suppressWarnings({ centroids <- st_centroid(merged_cont) })
+    coords_df <- as.data.frame(st_coordinates(centroids))
+    ann_df <- data.frame(STUSPS = merged_cont$STUSPS,
+                          coef_val = merged_cont$coef_val,
+                          X = coords_df$X, Y = coords_df$Y,
+                          stringsAsFactors = FALSE)
+    ann_df <- ann_df[!is.na(ann_df$coef_val) &
+                       ann_df$X > -125 & ann_df$X < -66 &
+                       ann_df$Y > 24   & ann_df$Y < 50, ]
+
+    top5     <- ann_df[order(-ann_df$coef_val), ][seq_len(min(5, nrow(ann_df))), ]
+    bot3     <- ann_df[order( ann_df$coef_val), ][seq_len(min(3, nrow(ann_df))), ]
+    ann_show <- unique(rbind(top5, bot3))
+
+    p <- ggplot() +
+      geom_sf(data = merged_cont[is.na(merged_cont$coef_val), ],
+              fill = "#cccccc", color = "white", linewidth = 0.3) +
+      geom_sf(data = merged_cont[!is.na(merged_cont$coef_val), ],
+              aes(fill = coef_val), color = "white", linewidth = 0.3) +
+      geom_label(data = ann_show,
+                 aes(x = X, y = Y,
+                     label = sprintf("%s\n%.2f", STUSPS, coef_val)),
+                 size = 2.5, fontface = "bold", fill = "white", alpha = 0.75,
+                 label.size = 0, label.padding = unit(0.15, "lines")) +
+      scale_fill_gradientn(
+        colors = rev(brewer.pal(11, "RdBu")),
+        limits = c(vmin_s, vmax_s), oob = squish, name = "Avg\nCoefficient"
+      ) +
+      coord_sf(xlim = c(-125, -66), ylim = c(24, 50), expand = FALSE) +
+      labs(title = title_str) +
+      theme_void(base_size = 12) +
+      theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+            legend.position = "right")
+
+    print(p)
+
+  }
+
+  if (any(grepl("^Origin_State", coef_long$Feature)))
+    plot_state_map("Origin_State",
+                   "Average Coefficient by Origin State (2004–2008)",
+                   "q3_origin_state_heatmap.png")
+
+  if (any(grepl("^Dest_State", coef_long$Feature)))
+    plot_state_map("Dest_State",
+                   "Average Coefficient by Destination State (2004–2008)",
+                   "q3_dest_state_heatmap.png")
+}
+```
+
+## Question C – Findings
+
+-   **Distance** is the strongest and most stable pre-flight predictor
+    across all five years. Longer flights face a higher diversion risk,
+    likely because they traverse more airspace and are more exposed to
+    weather systems en route.
+-   **Plane age** has a near-zero coefficient every year, confirming the
+    EDA finding and the result from Question B — aircraft age is
+    not a meaningful predictor of operational disruption.
+-   **Carrier** coefficients vary substantially between airlines and
+    shift year to year, reflecting differences in route networks,
+    operational practices, and fleet management. The carrier with the
+    highest mean diversion coefficient (most diversion-prone) and the
+    one with the lowest (least diversion-prone) are identified by full
+    name via `carriers.csv` in the table above.
+-   The prediction model achieves **AUC above 0.5** on unseen 2008 data,
+    confirming genuine predictive signal beyond random guessing. Low
+    precision and F1 are expected given that diversions represent under
+    0.3% of all flights — a model that predicts "never diverted" for
+    every flight would achieve near-perfect accuracy but zero recall.
+
+------------------------------------------------------------------------
+
+# 7. Summary of All Findings {#summary}
+
+| Question | Finding |
+|------------------------------------|------------------------------------|
+| **A: Best time to fly** | Fly early morning (\~06:00) on Tuesday or Wednesday. Avoid Thursday/Friday evenings 18:00–21:00. Pattern stable across all 5 years. |
+| **B: Older planes** | Weak positive relationship (r ≈ 0.01–0.02). Carrier and route are far stronger predictors. |
+| **C: Diversion prediction** | Distance is the strongest and most consistent pre-flight predictor. Carrier also matters and shifts year to year. AUC above 0.5 on unseen 2008 data confirms genuine predictive power`. |
+
+------------------------------------------------------------------------
